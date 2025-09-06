@@ -43,6 +43,7 @@ import (
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/vfs/vfscache"
 	"github.com/rclone/rclone/vfs/vfscommon"
+	"github.com/rclone/rclone/vfs/vfsmeta"
 )
 
 //go:embed vfs.md
@@ -179,6 +180,7 @@ type VFS struct {
 	root        *Dir
 	Opt         vfscommon.Options
 	cache       *vfscache.Cache
+	metaStore   vfsmeta.Store
 	cancel      context.CancelFunc
 	cancelCache context.CancelFunc
 	usageMu     sync.Mutex
@@ -214,6 +216,21 @@ func New(f fs.Fs, opt *vfscommon.Options) *VFS {
 
 	// Fill out anything else
 	vfs.Opt.Init()
+	if vfs.Opt.PersistMetadata {
+		switch vfs.Opt.MetadataStore {
+		case "backend":
+			vfs.metaStore = newBackendStore(vfs)
+		case "auto":
+			ft := vfs.f.Features()
+			if ft.ReadMetadata && ft.WriteMetadata {
+				vfs.metaStore = newBackendStore(vfs)
+			} else {
+				vfs.metaStore = newSidecarStore(vfs, vfs.Opt.MetadataExtension)
+			}
+		default:
+			vfs.metaStore = newSidecarStore(vfs, vfs.Opt.MetadataExtension)
+		}
+	}
 
 	// Find a VFS with the same name and options and return it if possible
 	activeMu.Lock()
@@ -605,6 +622,11 @@ func (vfs *VFS) Rename(oldName, newName string) error {
 	if err != nil {
 		return err
 	}
+	if vfs.metaStore != nil &&
+		!strings.HasSuffix(oldName, vfs.Opt.MetadataExtension) &&
+		(vfs.Opt.PosixMetadataExtension == "" || !strings.HasSuffix(oldName, vfs.Opt.PosixMetadataExtension)) {
+		_ = vfs.metaStore.Rename(context.Background(), oldName, newName, false)
+	}
 	return nil
 }
 
@@ -709,6 +731,11 @@ func (vfs *VFS) Remove(name string) error {
 	err = node.Remove()
 	if err != nil {
 		return err
+	}
+	if vfs.metaStore != nil &&
+		!strings.HasSuffix(name, vfs.Opt.MetadataExtension) &&
+		(vfs.Opt.PosixMetadataExtension == "" || !strings.HasSuffix(name, vfs.Opt.PosixMetadataExtension)) {
+		_ = vfs.metaStore.Delete(context.Background(), name, node.IsDir())
 	}
 	return nil
 }
@@ -825,6 +852,56 @@ func (vfs *VFS) WriteFile(name string, data []byte, perm os.FileMode) (err error
 	defer fs.CheckClose(fh, &err)
 	_, err = fh.Write(data)
 	return err
+}
+
+// LoadMetadata loads merged VFS metadata for the given path.
+func (vfs *VFS) LoadMetadata(ctx context.Context, path string, isDir bool) (vfsmeta.Meta, error) {
+	if vfs.metaStore == nil {
+		return vfsmeta.Meta{}, nil
+	}
+	// Ignore POSIX sidecar paths
+	if ext := vfs.Opt.PosixMetadataExtension; ext != "" && strings.HasSuffix(path, ext) {
+		return vfsmeta.Meta{}, nil
+	}
+	return vfs.metaStore.Load(ctx, path, isDir)
+}
+
+// SaveMetadata merges and persists VFS metadata for the given path.
+func (vfs *VFS) SaveMetadata(ctx context.Context, path string, isDir bool, m vfsmeta.Meta) error {
+	if vfs.metaStore == nil {
+		return nil
+	}
+	// Ignore POSIX sidecar paths
+	if ext := vfs.Opt.PosixMetadataExtension; ext != "" && strings.HasSuffix(path, ext) {
+		return nil
+	}
+	cur, _ := vfs.metaStore.Load(ctx, path, isDir)
+	cur.Merge(m)
+	return vfs.metaStore.Save(ctx, path, isDir, cur)
+}
+
+// RenameMetadata renames metadata associated with the given path.
+func (vfs *VFS) RenameMetadata(ctx context.Context, oldPath, newPath string, isDir bool) error {
+	if vfs.metaStore == nil {
+		return nil
+	}
+	// Ignore POSIX sidecar paths
+	if ext := vfs.Opt.PosixMetadataExtension; ext != "" && (strings.HasSuffix(oldPath, ext) || strings.HasSuffix(newPath, ext)) {
+		return nil
+	}
+	return vfs.metaStore.Rename(ctx, oldPath, newPath, isDir)
+}
+
+// DeleteMetadata deletes metadata associated with the given path.
+func (vfs *VFS) DeleteMetadata(ctx context.Context, path string, isDir bool) error {
+	if vfs.metaStore == nil {
+		return nil
+	}
+	// Ignore POSIX sidecar paths
+	if ext := vfs.Opt.PosixMetadataExtension; ext != "" && strings.HasSuffix(path, ext) {
+		return nil
+	}
+	return vfs.metaStore.Delete(ctx, path, isDir)
 }
 
 // AddVirtual adds the object (file or dir) to the directory cache

@@ -3,8 +3,10 @@
 package nfs
 
 import (
+	"context"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,13 +33,30 @@ func setSys(fi os.FileInfo) {
 		fs.Errorf(fi, "internal error: %T is not a vfs.Node", fi)
 		return
 	}
-	vfs := node.VFS()
+	vv := node.VFS()
 	// Set the UID and GID for the node passed in from the VFS defaults.
 	stat := file.FileInfo{
 		Nlink:  1,
-		UID:    vfs.Opt.UID,
-		GID:    vfs.Opt.GID,
+		UID:    vv.Opt.UID,
+		GID:    vv.Opt.GID,
 		Fileid: node.Inode(), // without this mounting doesn't work on Linux
+	}
+	if vv.Opt.PersistMetadata {
+		store := &vfs.PosixMetaStore{Vfs: vv, Ext: vv.Opt.PosixMetadataExtension}
+		if !store.IsSidecarPath(node.Path()) {
+			if m, err := store.Load(context.TODO(), node.Path()); err == nil {
+				if m.UID != nil {
+					if v, err2 := strconv.ParseUint(*m.UID, 10, 32); err2 == nil {
+						stat.UID = uint32(v)
+					}
+				}
+				if m.GID != nil {
+					if v, err2 := strconv.ParseUint(*m.GID, 10, 32); err2 == nil {
+						stat.GID = uint32(v)
+					}
+				}
+			}
+		}
 	}
 	node.SetSys(&stat)
 }
@@ -86,19 +105,82 @@ func (f *FS) Stat(filename string) (fi os.FileInfo, err error) {
 		return nil, err
 	}
 	setSys(fi)
+	// Overlay POSIX metadata on mode and times if available
+	if f.vfs.Opt.PersistMetadata {
+		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
+		if !store.IsSidecarPath(filename) {
+			if m, err2 := store.Load(context.TODO(), filename); err2 == nil {
+				fi = withOverlayFileInfo(fi, m)
+			}
+		}
+	}
 	return fi, nil
+}
+
+// overlayFileInfo wraps os.FileInfo to override Mode and ModTime based on posix meta
+type overlayFileInfo struct {
+	os.FileInfo
+	modeOverride  *os.FileMode
+	mtimeOverride *time.Time
+}
+
+func (o overlayFileInfo) Mode() os.FileMode {
+	if o.modeOverride != nil {
+		return *o.modeOverride
+	}
+	return o.FileInfo.Mode()
+}
+
+func (o overlayFileInfo) ModTime() time.Time {
+	if o.mtimeOverride != nil {
+		return *o.mtimeOverride
+	}
+	return o.FileInfo.ModTime()
+}
+
+func withOverlayFileInfo(fi os.FileInfo, m vfs.PosixMeta) os.FileInfo {
+	var om *os.FileMode
+	var mt *time.Time
+	if m.Mode != nil {
+		mode := vfs.ParsePosixMode(*m.Mode)
+		om = &mode
+	}
+	if m.Mtime != nil {
+		t := vfs.ParsePosixTime(*m.Mtime)
+		if !t.IsZero() {
+			mt = &t
+		}
+	}
+	if om == nil && mt == nil {
+		return fi
+	}
+	return overlayFileInfo{FileInfo: fi, modeOverride: om, mtimeOverride: mt}
 }
 
 // Rename renames a file
 func (f *FS) Rename(oldpath, newpath string) (err error) {
 	defer log.Trace(oldpath, "newpath=%q", newpath)("err=%v", &err)
-	return f.vfs.Rename(oldpath, newpath)
+	err = f.vfs.Rename(oldpath, newpath)
+	if err == nil && f.vfs.Opt.PersistMetadata {
+		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
+		if !(store.IsSidecarPath(oldpath) || store.IsSidecarPath(newpath)) {
+			_ = store.Rename(context.TODO(), oldpath, newpath)
+		}
+	}
+	return err
 }
 
 // Remove deletes a file
 func (f *FS) Remove(filename string) (err error) {
 	defer log.Trace(filename, "")("err=%v", &err)
-	return f.vfs.Remove(filename)
+	err = f.vfs.Remove(filename)
+	if err == nil && f.vfs.Opt.PersistMetadata {
+		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
+		if !store.IsSidecarPath(filename) {
+			_ = store.Delete(context.TODO(), filename)
+		}
+	}
+	return err
 }
 
 // Join joins path elements
@@ -171,6 +253,14 @@ func (f *FS) Chmod(name string, mode os.FileMode) (err error) {
 	if err == vfs.ENOSYS {
 		err = nil
 	}
+	if err == nil && f.vfs.Opt.PersistMetadata {
+		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
+		if !store.IsSidecarPath(name) {
+			v := vfs.FormatPosixMode(mode, false)
+			m := vfs.PosixMeta{Mode: &v}
+			_ = store.Save(context.TODO(), name, m)
+		}
+	}
 	return err
 }
 
@@ -192,13 +282,33 @@ func (f *FS) Chown(name string, uid, gid int) (err error) {
 			fs.Logf(f, "Error while closing file: %e", err)
 		}
 	}()
-	return file.Chown(uid, gid)
+	err = file.Chown(uid, gid)
+	if err == nil && f.vfs.Opt.PersistMetadata {
+		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
+		if !store.IsSidecarPath(name) {
+			u := strconv.FormatUint(uint64(uid), 10)
+			g := strconv.FormatUint(uint64(gid), 10)
+			m := vfs.PosixMeta{UID: &u, GID: &g}
+			_ = store.Save(context.TODO(), name, m)
+		}
+	}
+	return err
 }
 
 // Chtimes changes the access time and modified time
 func (f *FS) Chtimes(name string, atime time.Time, mtime time.Time) (err error) {
 	defer log.Trace(name, "atime=%v, mtime=%v", atime, mtime)("err=%v", &err)
-	return f.vfs.Chtimes(name, atime, mtime)
+	err = f.vfs.Chtimes(name, atime, mtime)
+	if err == nil && f.vfs.Opt.PersistMetadata {
+		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
+		if !store.IsSidecarPath(name) {
+			a := atime.UTC().Format(time.RFC3339)
+			m := mtime.UTC().Format(time.RFC3339)
+			meta := vfs.PosixMeta{Atime: &a, Mtime: &m}
+			_ = store.Save(context.TODO(), name, meta)
+		}
+	}
+	return err
 }
 
 // Chroot is not supported in VFS

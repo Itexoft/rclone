@@ -170,6 +170,21 @@ var OptionsInfo = fs.Options{{
 	Default: "",
 	Help:    "Set the extension to read metadata from.",
 	Groups:  "VFS",
+}, {
+	Name:    "vfs_persist_metadata",
+	Default: false,
+	Help:    "Persist POSIX metadata for files",
+	Groups:  "VFS",
+}, {
+	Name:    "vfs_metadata_store",
+	Default: "auto",
+	Help:    "Backend used for metadata persistence",
+	Groups:  "VFS",
+}, {
+	Name:    "vfs_posix_metadata_extension",
+	Default: "",
+	Help:    "Set the extension for POSIX metadata sidecar",
+	Groups:  "VFS",
 }}
 
 func init() {
@@ -210,6 +225,9 @@ type Options struct {
 	FastFingerprint    bool          `config:"vfs_fast_fingerprint"` // if set use fast fingerprints
 	DiskSpaceTotalSize fs.SizeSuffix `config:"vfs_disk_space_total_size"`
 	MetadataExtension  string        `config:"vfs_metadata_extension"` // if set respond to files with this extension with metadata
+	PersistMetadata    bool          `config:"vfs_persist_metadata"`
+	MetadataStore      string        `config:"vfs_metadata_store"`
+	PosixMetadataExtension string    `config:"vfs_posix_metadata_extension"`
 }
 
 // Opt is the default options modified by the environment variables and command line flags
@@ -218,6 +236,13 @@ var Opt Options
 // Init the options, making sure everything is within range
 func (opt *Options) Init() {
 	ci := fs.GetConfig(context.Background())
+
+	if opt.PersistMetadata {
+		// Default POSIX sidecar extension if not explicitly set
+		if opt.PosixMetadataExtension == "" {
+			opt.PosixMetadataExtension = ".posixmeta"
+		}
+	}
 
 	// Override --vfs-links with --links if set
 	if ci.Links {

@@ -5,11 +5,13 @@ package mount
 import (
 	"context"
 	"os"
+	"strconv"
 	"syscall"
 	"time"
 
 	"bazil.org/fuse"
 	fusefs "bazil.org/fuse/fs"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/vfs"
 )
@@ -37,6 +39,38 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 	a.Atime = modTime
 	a.Mtime = modTime
 	a.Ctime = modTime
+	if f.VFS().Opt.PersistMetadata {
+		store := &vfs.PosixMetaStore{Vfs: f.VFS(), Ext: f.VFS().Opt.PosixMetadataExtension}
+		if !store.IsSidecarPath(f.Path()) {
+			if m, err2 := store.Load(ctx, f.Path()); err2 == nil {
+				if m.Mode != nil {
+					a.Mode = vfs.ParsePosixMode(*m.Mode)
+				}
+				if m.UID != nil {
+					if v, err := strconv.ParseUint(*m.UID, 10, 32); err == nil {
+					    a.Uid = uint32(v)
+					}
+				}
+				if m.GID != nil {
+					if v, err := strconv.ParseUint(*m.GID, 10, 32); err == nil {
+					    a.Gid = uint32(v)
+					}
+				}
+				if m.Atime != nil {
+					if t := vfs.ParsePosixTime(*m.Atime); !t.IsZero() {
+					    a.Atime = t
+					}
+				}
+				if m.Mtime != nil {
+					if t := vfs.ParsePosixTime(*m.Mtime); !t.IsZero() {
+					    a.Mtime = t
+					}
+				}
+				// Do not set Ctime from Btime; leave Ctime as-is
+			}
+		}
+	}
+	
 	a.Blocks = Blocks
 	return nil
 }
@@ -47,16 +81,64 @@ var _ fusefs.NodeSetattrer = (*File)(nil)
 // Setattr handles attribute changes from FUSE. Currently supports ModTime and Size only
 func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) (err error) {
 	defer log.Trace(f, "a=%+v", req)("err=%v", &err)
-	if !f.VFS().Opt.NoModTime {
-		if req.Valid.Mtime() {
-			err = f.File.SetModTime(req.Mtime)
-		} else if req.Valid.MtimeNow() {
-			err = f.File.SetModTime(time.Now())
+
+	if req.Valid.Size() {
+		if e := f.File.Truncate(int64(req.Size)); err == nil {
+			err = e
 		}
 	}
-	if req.Valid.Size() {
-		err = f.File.Truncate(int64(req.Size))
+
+	if !f.VFS().Opt.NoModTime {
+		if req.Valid.Mtime() {
+			if e := f.File.SetModTime(req.Mtime); err == nil {
+				err = e
+			}
+		} else if req.Valid.MtimeNow() {
+			if e := f.File.SetModTime(time.Now()); err == nil {
+				err = e
+			}
+		}
 	}
+
+	if f.VFS().Opt.PersistMetadata {
+		store := &vfs.PosixMetaStore{Vfs: f.VFS(), Ext: f.VFS().Opt.PosixMetadataExtension}
+		if !store.IsSidecarPath(f.Path()) {
+			var m vfs.PosixMeta
+			if req.Valid.Mode() {
+				v := vfs.FormatPosixMode(req.Mode, false)
+				m.Mode = &v
+			}
+			if req.Valid.Uid() {
+				v := strconv.FormatUint(uint64(req.Uid), 10)
+				m.UID = &v
+			}
+			if req.Valid.Gid() {
+				v := strconv.FormatUint(uint64(req.Gid), 10)
+				m.GID = &v
+			}
+			if req.Valid.Atime() {
+				v := req.Atime.UTC().Format(time.RFC3339)
+				m.Atime = &v
+			} else if req.Valid.AtimeNow() {
+				v := time.Now().UTC().Format(time.RFC3339)
+				m.Atime = &v
+			}
+			if req.Valid.Mtime() {
+				v := req.Mtime.UTC().Format(time.RFC3339)
+				m.Mtime = &v
+			} else if req.Valid.MtimeNow() {
+				v := time.Now().UTC().Format(time.RFC3339)
+				m.Mtime = &v
+			}
+			if vfs.PosixAnyFieldSet(m) {
+				if err2 := store.Save(ctx, f.Path(), m); err2 != nil {
+					fs.Debugf(f, "persist metadata failed: %v", err2)
+				}
+				_ = f.fsys.server.InvalidateNodeAttr(f)
+			}
+		}
+	}
+
 	return translateError(err)
 }
 
