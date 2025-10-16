@@ -486,3 +486,19 @@ total 1048578
 If the file has no metadata it will be returned as `{}` and if there
 is an error reading the metadata the error will be returned as
 `{"error":"error string"}`.
+
+
+#### Persisting POSIX-like Metadata
+
+The VFS can persist POSIX-like attributes (mode/uid/gid/atime/mtime) separately from
+the backend's native attributes.
+
+- Enable with `--vfs-persist-metadata`.
+- Control storage with `--vfs-metadata-store`:
+  - `backend`: store metadata on the backend via fs metadata (if supported).
+  - `sidecar` or default: store metadata in sidecar files.
+- Sidecar extension is controlled by `--vfs-metadata-extension` (default ".metadata" when
+  `--vfs-persist-metadata` is set and metadata store is not `backend`).
+- No `.posixmeta` support; there is no backward compatibility layer.
+- Overlay applies after baseline attributes in Attr handlers; backend ACLs/ownership are not changed.
+- Metadata is saved on setattr best-effort and failures are logged at debug level; FUSE/NFS ops do not fail due to metadata I/O.

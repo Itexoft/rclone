@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/vfs"
+	"github.com/rclone/rclone/vfs/vfsmeta"
 )
 
 // Dir represents a directory entry
@@ -41,33 +41,22 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 	a.Mtime = modTime
 	a.Ctime = modTime
 	if d.VFS().Opt.PersistMetadata {
-		store := &vfs.PosixMetaStore{Vfs: d.VFS(), Ext: d.VFS().Opt.PosixMetadataExtension}
-		if !store.IsSidecarPath(d.Path()) {
-			if m, err2 := store.Load(ctx, d.Path()); err2 == nil {
-				if m.Mode != nil {
-					a.Mode = vfs.ParsePosixMode(*m.Mode)
-				}
-				if m.UID != nil {
-					if v, err := strconv.ParseUint(*m.UID, 10, 32); err == nil {
-					    a.Uid = uint32(v)
-					}
-				}
-				if m.GID != nil {
-					if v, err := strconv.ParseUint(*m.GID, 10, 32); err == nil {
-					    a.Gid = uint32(v)
-					}
-				}
-				if m.Atime != nil {
-					if t := vfs.ParsePosixTime(*m.Atime); !t.IsZero() {
-					    a.Atime = t
-					}
-				}
-				if m.Mtime != nil {
-					if t := vfs.ParsePosixTime(*m.Mtime); !t.IsZero() {
-					    a.Mtime = t
-					}
-				}
-				// Do not set Ctime from Btime; leave Ctime as-is
+		if m, err2 := d.VFS().LoadMetadata(ctx, d.Path(), true); err2 == nil {
+			if m.Mode != nil {
+				perm := os.FileMode(*m.Mode) & os.ModePerm
+				a.Mode = (a.Mode & os.ModeType) | perm
+			}
+			if m.UID != nil {
+				a.Uid = *m.UID
+			}
+			if m.GID != nil {
+				a.Gid = *m.GID
+			}
+			if m.Mtime != nil {
+				a.Mtime = m.Mtime.UTC()
+			}
+			if m.Atime != nil {
+				a.Atime = m.Atime.UTC()
 			}
 		}
 	}
@@ -91,18 +80,44 @@ func (d *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.
 	}
 
 	if d.VFS().Opt.PersistMetadata {
-		store := &vfs.PosixMetaStore{Vfs: d.VFS(), Ext: d.VFS().Opt.PosixMetadataExtension}
-		if !store.IsSidecarPath(d.Path()) {
-			var m vfs.PosixMeta
-			if req.Valid.Mode() { v := vfs.FormatPosixMode(req.Mode, true); m.Mode = &v }
-			if req.Valid.Uid()  { v := strconv.FormatUint(uint64(req.Uid), 10); m.UID = &v }
-			if req.Valid.Gid()  { v := strconv.FormatUint(uint64(req.Gid), 10); m.GID = &v }
-			if req.Valid.Atime()     { v := req.Atime.UTC().Format(time.RFC3339); m.Atime = &v } else if req.Valid.AtimeNow() { v := time.Now().UTC().Format(time.RFC3339); m.Atime = &v }
-			if req.Valid.Mtime()     { v := req.Mtime.UTC().Format(time.RFC3339); m.Mtime = &v } else if req.Valid.MtimeNow() { v := time.Now().UTC().Format(time.RFC3339); m.Mtime = &v }
-			if vfs.PosixAnyFieldSet(m) {
-				if err2 := store.Save(ctx, d.Path(), m); err2 != nil { fs.Debugf(d, "persist metadata failed: %v", err2) }
-				_ = d.fsys.server.InvalidateNodeAttr(d)
+		var m vfsmeta.Meta
+		changed := false
+		if req.Valid.Mode() {
+			v := uint32(req.Mode)
+			m.Mode = &v
+			changed = true
+		}
+		if req.Valid.Uid() {
+			v := uint32(req.Uid)
+			m.UID = &v
+			changed = true
+		}
+		if req.Valid.Gid() {
+			v := uint32(req.Gid)
+			m.GID = &v
+			changed = true
+		}
+		if req.Valid.Atime() || req.Valid.AtimeNow() {
+			t := req.Atime
+			if req.Valid.AtimeNow() {
+				t = time.Now()
 			}
+			m.Atime = &t
+			changed = true
+		}
+		if req.Valid.Mtime() || req.Valid.MtimeNow() {
+			t := req.Mtime
+			if req.Valid.MtimeNow() {
+				t = time.Now()
+			}
+			m.Mtime = &t
+			changed = true
+		}
+		if changed {
+			if err2 := d.VFS().SaveMetadata(ctx, d.Path(), true, m); err2 != nil {
+				fs.Debugf(d, "persist metadata failed: %v", err2)
+			}
+			_ = d.fsys.server.InvalidateNodeAttr(d)
 		}
 	}
 
@@ -234,11 +249,9 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) (err error) {
 		return translateError(err)
 	}
 	if d.VFS().Opt.PersistMetadata {
-		store := &vfs.PosixMetaStore{Vfs: d.VFS(), Ext: d.VFS().Opt.PosixMetadataExtension}
-		if !store.IsSidecarPath(path.Join(d.Path(), req.Name)) {
-			if err2 := store.Delete(ctx, path.Join(d.Path(), req.Name)); err2 != nil {
-				fs.Debugf(d, "persist metadata delete failed: %v", err2)
-			}
+		p := path.Join(d.Path(), req.Name)
+		if err2 := d.VFS().DeleteMetadata(ctx, p, false); err2 != nil {
+			fs.Debugf(d, "persist metadata delete failed: %v", err2)
 		}
 	}
 	return nil
@@ -268,13 +281,10 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fusefs
 		return translateError(err)
 	}
 	if d.VFS().Opt.PersistMetadata {
-		store := &vfs.PosixMetaStore{Vfs: d.VFS(), Ext: d.VFS().Opt.PosixMetadataExtension}
 		oldP := path.Join(d.Path(), req.OldName)
 		newP := path.Join(destDir.Path(), req.NewName)
-		if !(store.IsSidecarPath(oldP) || store.IsSidecarPath(newP)) {
-			if err2 := store.Rename(ctx, oldP, newP); err2 != nil {
-				fs.Debugf(d, "persist metadata rename failed: %v", err2)
-			}
+		if err2 := d.VFS().RenameMetadata(ctx, oldP, newP, false); err2 != nil {
+			fs.Debugf(d, "persist metadata rename failed: %v", err2)
 		}
 	}
 

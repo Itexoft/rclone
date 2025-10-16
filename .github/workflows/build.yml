@@ -169,6 +169,26 @@ jobs:
         run: |
           rclone version
 
+      - name: Collect build artifacts (Linux/macOS)
+        if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
+        run: |
+          mkdir -p ci-artifacts
+          if [ -f rclone ]; then cp -a rclone ci-artifacts/ ; fi
+          if [ -d build ]; then cp -a build ci-artifacts/ ; fi
+          if compgen -G "*.zip" > /dev/null; then cp -a *.zip ci-artifacts/ ; fi
+          if compgen -G "*.tar.gz" > /dev/null; then cp -a *.tar.gz ci-artifacts/ ; fi
+          if compgen -G "*.deb" > /dev/null; then cp -a *.deb ci-artifacts/ ; fi
+          if compgen -G "*.rpm" > /dev/null; then cp -a *.rpm ci-artifacts/ ; fi
+
+      - name: Upload build artifacts (Linux/macOS)
+        if: matrix.os == 'ubuntu-latest' || matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-${{ matrix.job_name }}-${{ github.sha }}
+          path: ci-artifacts
+          if-no-files-found: warn
+          retention-days: 7
+          
       - name: Run tests
         run: |
           make quicktest

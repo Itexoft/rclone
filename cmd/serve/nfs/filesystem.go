@@ -6,7 +6,6 @@ import (
 	"context"
 	"os"
 	"path"
-	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +14,7 @@ import (
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
+	"github.com/rclone/rclone/vfs/vfsmeta"
 	"github.com/willscott/go-nfs/file"
 )
 
@@ -42,19 +42,12 @@ func setSys(fi os.FileInfo) {
 		Fileid: node.Inode(), // without this mounting doesn't work on Linux
 	}
 	if vv.Opt.PersistMetadata {
-		store := &vfs.PosixMetaStore{Vfs: vv, Ext: vv.Opt.PosixMetadataExtension}
-		if !store.IsSidecarPath(node.Path()) {
-			if m, err := store.Load(context.TODO(), node.Path()); err == nil {
-				if m.UID != nil {
-					if v, err2 := strconv.ParseUint(*m.UID, 10, 32); err2 == nil {
-						stat.UID = uint32(v)
-					}
-				}
-				if m.GID != nil {
-					if v, err2 := strconv.ParseUint(*m.GID, 10, 32); err2 == nil {
-						stat.GID = uint32(v)
-					}
-				}
+		if m, err := vv.LoadMetadata(context.TODO(), node.Path(), fi.IsDir()); err == nil {
+			if m.UID != nil {
+				stat.UID = *m.UID
+			}
+			if m.GID != nil {
+				stat.GID = *m.GID
 			}
 		}
 	}
@@ -73,8 +66,15 @@ func (f *FS) ReadDir(path string) (dir []os.FileInfo, err error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, fi := range dir {
+	for i, fi := range dir {
 		setSys(fi)
+		if f.vfs.Opt.PersistMetadata {
+			if n, ok := fi.(vfs.Node); ok {
+				if m, err2 := f.vfs.LoadMetadata(context.TODO(), n.Path(), fi.IsDir()); err2 == nil {
+					dir[i] = withOverlayFileInfo(fi, m)
+				}
+			}
+		}
 	}
 	return dir, nil
 }
@@ -107,11 +107,8 @@ func (f *FS) Stat(filename string) (fi os.FileInfo, err error) {
 	setSys(fi)
 	// Overlay POSIX metadata on mode and times if available
 	if f.vfs.Opt.PersistMetadata {
-		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
-		if !store.IsSidecarPath(filename) {
-			if m, err2 := store.Load(context.TODO(), filename); err2 == nil {
-				fi = withOverlayFileInfo(fi, m)
-			}
+		if m, err2 := f.vfs.LoadMetadata(context.TODO(), filename, fi.IsDir()); err2 == nil {
+			fi = withOverlayFileInfo(fi, m)
 		}
 	}
 	return fi, nil
@@ -138,15 +135,16 @@ func (o overlayFileInfo) ModTime() time.Time {
 	return o.FileInfo.ModTime()
 }
 
-func withOverlayFileInfo(fi os.FileInfo, m vfs.PosixMeta) os.FileInfo {
+func withOverlayFileInfo(fi os.FileInfo, m vfsmeta.Meta) os.FileInfo {
 	var om *os.FileMode
 	var mt *time.Time
 	if m.Mode != nil {
-		mode := vfs.ParsePosixMode(*m.Mode)
+		perm := os.FileMode(*m.Mode) & os.ModePerm
+		mode := (fi.Mode() & os.ModeType) | perm
 		om = &mode
 	}
 	if m.Mtime != nil {
-		t := vfs.ParsePosixTime(*m.Mtime)
+		t := m.Mtime.UTC()
 		if !t.IsZero() {
 			mt = &t
 		}
@@ -162,10 +160,7 @@ func (f *FS) Rename(oldpath, newpath string) (err error) {
 	defer log.Trace(oldpath, "newpath=%q", newpath)("err=%v", &err)
 	err = f.vfs.Rename(oldpath, newpath)
 	if err == nil && f.vfs.Opt.PersistMetadata {
-		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
-		if !(store.IsSidecarPath(oldpath) || store.IsSidecarPath(newpath)) {
-			_ = store.Rename(context.TODO(), oldpath, newpath)
-		}
+		_ = f.vfs.RenameMetadata(context.TODO(), oldpath, newpath, false)
 	}
 	return err
 }
@@ -175,10 +170,7 @@ func (f *FS) Remove(filename string) (err error) {
 	defer log.Trace(filename, "")("err=%v", &err)
 	err = f.vfs.Remove(filename)
 	if err == nil && f.vfs.Opt.PersistMetadata {
-		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
-		if !store.IsSidecarPath(filename) {
-			_ = store.Delete(context.TODO(), filename)
-		}
+		_ = f.vfs.DeleteMetadata(context.TODO(), filename, false)
 	}
 	return err
 }
@@ -221,6 +213,11 @@ func (f *FS) Lstat(filename string) (fi os.FileInfo, err error) {
 		return nil, err
 	}
 	setSys(fi)
+	if f.vfs.Opt.PersistMetadata {
+		if m, err2 := f.vfs.LoadMetadata(context.TODO(), filename, fi.IsDir()); err2 == nil {
+			fi = withOverlayFileInfo(fi, m)
+		}
+	}
 	return fi, nil
 }
 
@@ -254,12 +251,9 @@ func (f *FS) Chmod(name string, mode os.FileMode) (err error) {
 		err = nil
 	}
 	if err == nil && f.vfs.Opt.PersistMetadata {
-		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
-		if !store.IsSidecarPath(name) {
-			v := vfs.FormatPosixMode(mode, false)
-			m := vfs.PosixMeta{Mode: &v}
-			_ = store.Save(context.TODO(), name, m)
-		}
+		v := uint32(mode)
+		m := vfsmeta.Meta{Mode: &v}
+		_ = f.vfs.SaveMetadata(context.TODO(), name, false, m)
 	}
 	return err
 }
@@ -284,13 +278,10 @@ func (f *FS) Chown(name string, uid, gid int) (err error) {
 	}()
 	err = file.Chown(uid, gid)
 	if err == nil && f.vfs.Opt.PersistMetadata {
-		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
-		if !store.IsSidecarPath(name) {
-			u := strconv.FormatUint(uint64(uid), 10)
-			g := strconv.FormatUint(uint64(gid), 10)
-			m := vfs.PosixMeta{UID: &u, GID: &g}
-			_ = store.Save(context.TODO(), name, m)
-		}
+		u := uint32(uid)
+		g := uint32(gid)
+		m := vfsmeta.Meta{UID: &u, GID: &g}
+		_ = f.vfs.SaveMetadata(context.TODO(), name, false, m)
 	}
 	return err
 }
@@ -300,13 +291,10 @@ func (f *FS) Chtimes(name string, atime time.Time, mtime time.Time) (err error) 
 	defer log.Trace(name, "atime=%v, mtime=%v", atime, mtime)("err=%v", &err)
 	err = f.vfs.Chtimes(name, atime, mtime)
 	if err == nil && f.vfs.Opt.PersistMetadata {
-		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
-		if !store.IsSidecarPath(name) {
-			a := atime.UTC().Format(time.RFC3339)
-			m := mtime.UTC().Format(time.RFC3339)
-			meta := vfs.PosixMeta{Atime: &a, Mtime: &m}
-			_ = store.Save(context.TODO(), name, meta)
-		}
+		a := atime.UTC()
+		m := mtime.UTC()
+		meta := vfsmeta.Meta{Atime: &a, Mtime: &m}
+		_ = f.vfs.SaveMetadata(context.TODO(), name, false, meta)
 	}
 	return err
 }
