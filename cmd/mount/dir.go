@@ -49,22 +49,22 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 				}
 				if m.UID != nil {
 					if v, err := strconv.ParseUint(*m.UID, 10, 32); err == nil {
-					    a.Uid = uint32(v)
+						a.Uid = uint32(v)
 					}
 				}
 				if m.GID != nil {
 					if v, err := strconv.ParseUint(*m.GID, 10, 32); err == nil {
-					    a.Gid = uint32(v)
+						a.Gid = uint32(v)
 					}
 				}
 				if m.Atime != nil {
 					if t := vfs.ParsePosixTime(*m.Atime); !t.IsZero() {
-					    a.Atime = t
+						a.Atime = t
 					}
 				}
 				if m.Mtime != nil {
 					if t := vfs.ParsePosixTime(*m.Mtime); !t.IsZero() {
-					    a.Mtime = t
+						a.Mtime = t
 					}
 				}
 				// Do not set Ctime from Btime; leave Ctime as-is
@@ -94,13 +94,36 @@ func (d *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.
 		store := &vfs.PosixMetaStore{Vfs: d.VFS(), Ext: d.VFS().Opt.PosixMetadataExtension}
 		if !store.IsSidecarPath(d.Path()) {
 			var m vfs.PosixMeta
-			if req.Valid.Mode() { v := vfs.FormatPosixMode(req.Mode, true); m.Mode = &v }
-			if req.Valid.Uid()  { v := strconv.FormatUint(uint64(req.Uid), 10); m.UID = &v }
-			if req.Valid.Gid()  { v := strconv.FormatUint(uint64(req.Gid), 10); m.GID = &v }
-			if req.Valid.Atime()     { v := req.Atime.UTC().Format(time.RFC3339); m.Atime = &v } else if req.Valid.AtimeNow() { v := time.Now().UTC().Format(time.RFC3339); m.Atime = &v }
-			if req.Valid.Mtime()     { v := req.Mtime.UTC().Format(time.RFC3339); m.Mtime = &v } else if req.Valid.MtimeNow() { v := time.Now().UTC().Format(time.RFC3339); m.Mtime = &v }
+			if req.Valid.Mode() {
+				v := vfs.FormatPosixMode(req.Mode, true)
+				m.Mode = &v
+			}
+			if req.Valid.Uid() {
+				v := strconv.FormatUint(uint64(req.Uid), 10)
+				m.UID = &v
+			}
+			if req.Valid.Gid() {
+				v := strconv.FormatUint(uint64(req.Gid), 10)
+				m.GID = &v
+			}
+			if req.Valid.Atime() {
+				v := req.Atime.UTC().Format(time.RFC3339)
+				m.Atime = &v
+			} else if req.Valid.AtimeNow() {
+				v := time.Now().UTC().Format(time.RFC3339)
+				m.Atime = &v
+			}
+			if req.Valid.Mtime() {
+				v := req.Mtime.UTC().Format(time.RFC3339)
+				m.Mtime = &v
+			} else if req.Valid.MtimeNow() {
+				v := time.Now().UTC().Format(time.RFC3339)
+				m.Mtime = &v
+			}
 			if vfs.PosixAnyFieldSet(m) {
-				if err2 := store.Save(ctx, d.Path(), m); err2 != nil { fs.Debugf(d, "persist metadata failed: %v", err2) }
+				if err2 := store.Save(ctx, d.Path(), m); err2 != nil {
+					fs.Debugf(d, "persist metadata failed: %v", err2)
+				}
 				_ = d.fsys.server.InvalidateNodeAttr(d)
 			}
 		}

@@ -48,29 +48,29 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 				}
 				if m.UID != nil {
 					if v, err := strconv.ParseUint(*m.UID, 10, 32); err == nil {
-					    a.Uid = uint32(v)
+						a.Uid = uint32(v)
 					}
 				}
 				if m.GID != nil {
 					if v, err := strconv.ParseUint(*m.GID, 10, 32); err == nil {
-					    a.Gid = uint32(v)
+						a.Gid = uint32(v)
 					}
 				}
 				if m.Atime != nil {
 					if t := vfs.ParsePosixTime(*m.Atime); !t.IsZero() {
-					    a.Atime = t
+						a.Atime = t
 					}
 				}
 				if m.Mtime != nil {
 					if t := vfs.ParsePosixTime(*m.Mtime); !t.IsZero() {
-					    a.Mtime = t
+						a.Mtime = t
 					}
 				}
 				// Do not set Ctime from Btime; leave Ctime as-is
 			}
 		}
 	}
-	
+
 	a.Blocks = Blocks
 	return nil
 }

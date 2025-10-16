@@ -69,21 +69,49 @@ func (s *PosixMetaStore) Save(ctx context.Context, path string, m PosixMeta) err
 		return nil
 	}
 	cur, _ := s.Load(ctx, path)
-	if m.Mode != nil { cur.Mode = m.Mode }
-	if m.UID != nil { cur.UID = m.UID }
-	if m.GID != nil { cur.GID = m.GID }
-	if m.Mtime != nil { cur.Mtime = m.Mtime }
-	if m.Atime != nil { cur.Atime = m.Atime }
-	if m.Btime != nil { cur.Btime = m.Btime }
+	if m.Mode != nil {
+		cur.Mode = m.Mode
+	}
+	if m.UID != nil {
+		cur.UID = m.UID
+	}
+	if m.GID != nil {
+		cur.GID = m.GID
+	}
+	if m.Mtime != nil {
+		cur.Mtime = m.Mtime
+	}
+	if m.Atime != nil {
+		cur.Atime = m.Atime
+	}
+	if m.Btime != nil {
+		cur.Btime = m.Btime
+	}
 	p := s.metaPath(path)
 	tmp := p + ".tmp"
 	w, err := s.Vfs.Create(tmp)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	enc, err := json.Marshal(cur)
-	if err != nil { _ = w.Close(); _ = s.Vfs.Remove(tmp); return err }
-	if _, err = w.Write(enc); err != nil { _ = w.Close(); _ = s.Vfs.Remove(tmp); return err }
-	if err = w.Close(); err != nil { _ = s.Vfs.Remove(tmp); return err }
-	if err = s.Vfs.Rename(tmp, p); err != nil { _ = s.Vfs.Remove(tmp); return err }
+	if err != nil {
+		_ = w.Close()
+		_ = s.Vfs.Remove(tmp)
+		return err
+	}
+	if _, err = w.Write(enc); err != nil {
+		_ = w.Close()
+		_ = s.Vfs.Remove(tmp)
+		return err
+	}
+	if err = w.Close(); err != nil {
+		_ = s.Vfs.Remove(tmp)
+		return err
+	}
+	if err = s.Vfs.Rename(tmp, p); err != nil {
+		_ = s.Vfs.Remove(tmp)
+		return err
+	}
 	return nil
 }
 

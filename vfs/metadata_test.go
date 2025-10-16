@@ -24,4 +24,3 @@ func TestMetadataSidecar(t *testing.T) {
 	require.NotNil(t, got.Mode)
 	require.Equal(t, m, *got.Mode)
 }
-

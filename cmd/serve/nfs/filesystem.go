@@ -73,8 +73,19 @@ func (f *FS) ReadDir(path string) (dir []os.FileInfo, err error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, fi := range dir {
+	for i, fi := range dir {
 		setSys(fi)
+		if f.vfs.Opt.PersistMetadata {
+			if n, ok := fi.(vfs.Node); ok {
+				store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
+				p := n.Path()
+				if !store.IsSidecarPath(p) {
+					if m, err2 := store.Load(context.TODO(), p); err2 == nil {
+						dir[i] = withOverlayFileInfo(fi, m)
+					}
+				}
+			}
+		}
 	}
 	return dir, nil
 }
@@ -142,7 +153,8 @@ func withOverlayFileInfo(fi os.FileInfo, m vfs.PosixMeta) os.FileInfo {
 	var om *os.FileMode
 	var mt *time.Time
 	if m.Mode != nil {
-		mode := vfs.ParsePosixMode(*m.Mode)
+		perm := vfs.ParsePosixMode(*m.Mode) & os.ModePerm
+		mode := (fi.Mode() & os.ModeType) | perm
 		om = &mode
 	}
 	if m.Mtime != nil {
@@ -221,6 +233,14 @@ func (f *FS) Lstat(filename string) (fi os.FileInfo, err error) {
 		return nil, err
 	}
 	setSys(fi)
+	if f.vfs.Opt.PersistMetadata {
+		store := &vfs.PosixMetaStore{Vfs: f.vfs, Ext: f.vfs.Opt.PosixMetadataExtension}
+		if !store.IsSidecarPath(filename) {
+			if m, err2 := store.Load(context.TODO(), filename); err2 == nil {
+				fi = withOverlayFileInfo(fi, m)
+			}
+		}
+	}
 	return fi, nil
 }
 
